@@ -1,0 +1,262 @@
+#!/usr/bin/env node
+/**
+ * yoto-upload
+ * Upload a folder of audiobooks to your Yoto account as MYO cards.
+ *
+ * Usage:
+ *   node bin/yoto-upload.js /path/to/audiobooks
+ */
+
+import { YotoClient, DEFAULT_CLIENT_ID } from 'yoto-nodejs-client'
+import { readdir, readFile, writeFile, mkdir, stat } from 'fs/promises'
+import { createHash } from 'crypto'
+import { join, extname, basename, resolve } from 'path'
+import { homedir } from 'os'
+
+const YOTO_API = 'https://api.yotoplay.com'
+const CLIENT_ID = DEFAULT_CLIENT_ID
+const CONFIG_DIR = join(homedir(), '.yoto-myo-uploader')
+const TOKENS_FILE = join(CONFIG_DIR, 'tokens.json')
+const PROGRESS_FILE = join(CONFIG_DIR, 'progress.json')
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+async function ensureConfigDir () {
+  await mkdir(CONFIG_DIR, { recursive: true })
+}
+
+async function loadTokens () {
+  try {
+    return JSON.parse(await readFile(TOKENS_FILE, 'utf8'))
+  } catch {
+    return null
+  }
+}
+
+async function saveTokens (tokens) {
+  await ensureConfigDir()
+  await writeFile(TOKENS_FILE, JSON.stringify(tokens, null, 2), 'utf8')
+}
+
+async function loadProgress (booksDir) {
+  try {
+    const all = JSON.parse(await readFile(PROGRESS_FILE, 'utf8'))
+    return all[booksDir] || {}
+  } catch {
+    return {}
+  }
+}
+
+async function markDone (booksDir, bookName, cardId) {
+  let all = {}
+  try { all = JSON.parse(await readFile(PROGRESS_FILE, 'utf8')) } catch {}
+  if (!all[booksDir]) all[booksDir] = {}
+  all[booksDir][bookName] = { cardId, uploadedAt: new Date().toISOString() }
+  await ensureConfigDir()
+  await writeFile(PROGRESS_FILE, JSON.stringify(all, null, 2), 'utf8')
+}
+
+// ── Auth ─────────────────────────────────────────────────────────────────────
+
+async function authenticate () {
+  const saved = await loadTokens()
+
+  if (saved) {
+    console.log('Using saved Yoto credentials.\n')
+    return new YotoClient({
+      clientId: CLIENT_ID,
+      accessToken: saved.accessToken,
+      refreshToken: saved.refreshToken,
+      onTokenRefresh: async (e) => saveTokens({
+        accessToken: e.updatedAccessToken,
+        refreshToken: e.updatedRefreshToken
+      })
+    })
+  }
+
+  const deviceAuth = await YotoClient.requestDeviceCode({ clientId: CLIENT_ID })
+  console.log('\n╔═══════════════════════════════════════════════════════════╗')
+  console.log('║  Log in to your Yoto account to continue:                 ║')
+  console.log(`║  ${deviceAuth.verification_uri_complete.padEnd(57)}║`)
+  console.log('╚═══════════════════════════════════════════════════════════╝\n')
+  process.stdout.write('Waiting for login ')
+
+  const tokens = await YotoClient.waitForDeviceAuthorization({
+    deviceCode: deviceAuth.device_code,
+    clientId: CLIENT_ID,
+    initialInterval: deviceAuth.interval * 1000,
+    expiresIn: deviceAuth.expires_in,
+    onPoll: () => process.stdout.write('.')
+  })
+  console.log('\n✓ Logged in!\n')
+
+  await saveTokens({
+    accessToken: tokens.access_token,
+    refreshToken: tokens.refresh_token
+  })
+
+  return new YotoClient({
+    clientId: CLIENT_ID,
+    accessToken: tokens.access_token,
+    refreshToken: tokens.refresh_token,
+    onTokenRefresh: async (e) => saveTokens({
+      accessToken: e.updatedAccessToken,
+      refreshToken: e.updatedRefreshToken
+    })
+  })
+}
+
+// ── Upload + transcode one track ──────────────────────────────────────────────
+// Full flow:
+//   1. Get presigned S3 URL from Yoto
+//   2. PUT file to S3 with Content-Type: audio/mpeg (triggers transcoding pipeline)
+//   3. Poll /media/upload/{uploadId}/transcoded until transcodedSha256 appears
+//   4. Return transcodedSha256 for use in trackUrl
+
+async function uploadAndTranscode (client, filePath, accessToken) {
+  const data = await readFile(filePath)
+  const sha256 = createHash('sha256').update(data).digest('hex')
+  const filename = basename(filePath)
+
+  const { upload } = await client.getAudioUploadUrl({ sha256, filename })
+
+  if (upload.uploadUrl) {
+    const resp = await fetch(upload.uploadUrl, {
+      method: 'PUT',
+      body: data,
+      headers: { 'Content-Type': 'audio/mpeg' }
+    })
+    if (!resp.ok) {
+      const body = await resp.text().catch(() => '')
+      throw new Error(`S3 upload failed for ${filename}: ${resp.status} ${body.substring(0, 200)}`)
+    }
+  }
+
+  // Poll until transcoding is complete (~10–30s per track)
+  for (let i = 0; i < 60; i++) {
+    await new Promise(r => setTimeout(r, 10000))
+    process.stdout.write('.')
+    const pollResp = await fetch(`${YOTO_API}/media/upload/${upload.uploadId}/transcoded`, {
+      headers: { Authorization: `Bearer ${accessToken}` }
+    })
+    const body = await pollResp.json()
+    const transcodedSha256 = body.transcode?.transcodedSha256
+    if (transcodedSha256) return transcodedSha256
+    if (body.transcode?.progress?.phase === 'failed') {
+      throw new Error(`Yoto transcoding failed for ${filename}`)
+    }
+  }
+  throw new Error(`Transcoding timed out for ${filename} after 10 minutes`)
+}
+
+// ── Main ──────────────────────────────────────────────────────────────────────
+
+async function main () {
+  const booksDir = resolve(process.argv[2] || '')
+
+  if (!process.argv[2]) {
+    console.error('Usage: node bin/yoto-upload.js /path/to/your/audiobooks')
+    console.error('')
+    console.error('The folder should contain one subfolder per book,')
+    console.error('with MP3 files inside each subfolder.')
+    process.exit(1)
+  }
+
+  try {
+    const s = await stat(booksDir)
+    if (!s.isDirectory()) throw new Error()
+  } catch {
+    console.error(`Error: folder not found: ${booksDir}`)
+    process.exit(1)
+  }
+
+  console.log(`\nyoto-myo-uploader`)
+  console.log(`Books folder: ${booksDir}\n`)
+
+  const client = await authenticate()
+  const tokens = await loadTokens()
+  const progress = await loadProgress(booksDir)
+
+  const entries = (await readdir(booksDir, { withFileTypes: true }))
+    .filter(e => e.isDirectory())
+    .map(e => e.name)
+    .sort()
+
+  if (entries.length === 0) {
+    console.error('No subfolders found in', booksDir)
+    process.exit(1)
+  }
+
+  console.log(`Found ${entries.length} book(s).\n`)
+
+  let uploaded = 0
+  let skipped = 0
+
+  for (let i = 0; i < entries.length; i++) {
+    const bookName = entries[i]
+    const bookDir = join(booksDir, bookName)
+
+    if (progress[bookName]) {
+      console.log(`[${i + 1}/${entries.length}] Skip (already uploaded): ${bookName}`)
+      skipped++
+      continue
+    }
+
+    console.log(`[${i + 1}/${entries.length}] ${bookName}`)
+
+    const files = (await readdir(bookDir))
+      .filter(f => extname(f).toLowerCase() === '.mp3')
+      .sort()
+
+    if (files.length === 0) {
+      console.log('  No MP3s found, skipping.\n')
+      continue
+    }
+
+    const chapters = []
+    for (let t = 0; t < files.length; t++) {
+      const trackTitle = files[t].replace(/^\d+[\s._-]+/, '').replace(/\.mp3$/i, '')
+      process.stdout.write(`  [${t + 1}/${files.length}] ${trackTitle} `)
+
+      const transcodedSha256 = await uploadAndTranscode(
+        client,
+        join(bookDir, files[t]),
+        tokens.accessToken
+      )
+      console.log(' ✓')
+
+      chapters.push({
+        key: `ch${String(t + 1).padStart(3, '0')}`,
+        title: trackTitle,
+        tracks: [{
+          key: `tr${String(t + 1).padStart(3, '0')}`,
+          title: trackTitle,
+          trackUrl: `yoto:#${transcodedSha256}`,
+          type: 'audio'
+        }]
+      })
+    }
+
+    const card = await client.createOrUpdateContent({
+      content: {
+        title: bookName,
+        content: { chapters }
+      }
+    })
+
+    const cardId = card.cardId || card.card?.cardId || 'unknown'
+    await markDone(booksDir, bookName, cardId)
+    console.log(`  ✓ Card created: ${cardId}\n`)
+    uploaded++
+  }
+
+  console.log(`\nDone! ${uploaded} card(s) uploaded, ${skipped} already skipped.`)
+  console.log('Check your Yoto app under My Cards > MYO.')
+}
+
+main().catch(err => {
+  console.error('\nError:', err.message)
+  if (err.statusCode) console.error('HTTP status:', err.statusCode)
+  if (err.textBody) console.error('Response:', err.textBody)
+  process.exit(1)
+})

@@ -1,0 +1,24 @@
+{
+  "name": "yoto-myo-uploader",
+  "version": "1.0.0",
+  "description": "Upload local audiobook folders to Yoto MYO cards, with a built-in web browser for your library",
+  "type": "module",
+  "bin": {
+    "yoto-upload": "./bin/yoto-upload.js",
+    "yoto-serve": "./bin/yoto-serve.js"
+  },
+  "scripts": {
+    "upload": "node bin/yoto-upload.js",
+    "serve": "node bin/yoto-serve.js"
+  },
+  "dependencies": {
+    "archiver": "^7.0.1",
+    "express": "^4.21.2",
+    "yoto-nodejs-client": "^0.0.11"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": ["yoto", "myo", "audiobook", "upload"],
+  "license": "MIT"
+}
