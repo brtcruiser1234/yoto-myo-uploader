@@ -12,6 +12,9 @@ import { readdir, readFile, writeFile, mkdir, stat } from 'fs/promises'
 import { createHash } from 'crypto'
 import { join, extname, basename, resolve } from 'path'
 import { homedir } from 'os'
+import { existsSync } from 'fs'
+
+const COVER_NAMES = ['cover.jpg', 'cover.jpeg', 'cover.png', 'folder.jpg', 'folder.jpeg', 'folder.png']
 
 const YOTO_API = 'https://api.yotoplay.com'
 const CLIENT_ID = DEFAULT_CLIENT_ID
@@ -237,10 +240,30 @@ async function main () {
       })
     }
 
+    // Upload cover art if present
+    let coverUrl = null
+    const coverFile = COVER_NAMES.map(n => join(bookDir, n)).find(p => existsSync(p))
+    if (coverFile) {
+      process.stdout.write('  Uploading cover art... ')
+      try {
+        const imageData = await readFile(coverFile)
+        const { coverImage } = await client.uploadCoverImage({
+          imageData,
+          filename: basename(coverFile),
+          coverType: 'myo'
+        })
+        coverUrl = coverImage.mediaUrl
+        console.log('✓')
+      } catch (e) {
+        console.log(`(skipped: ${e.message})`)
+      }
+    }
+
     const card = await client.createOrUpdateContent({
       content: {
         title: bookName,
-        content: { chapters }
+        content: { chapters },
+        ...(coverUrl && { metadata: { cover: { imageL: coverUrl } } })
       }
     })
 
