@@ -6,12 +6,14 @@
   "bin": {
     "yoto-convert": "./bin/yoto-convert.js",
     "yoto-upload": "./bin/yoto-upload.js",
-    "yoto-serve": "./bin/yoto-serve.js"
+    "yoto-serve": "./bin/yoto-serve.js",
+    "yoto-patch-covers": "./bin/yoto-patch-covers.js"
   },
   "scripts": {
     "convert": "node bin/yoto-convert.js",
     "upload": "node bin/yoto-upload.js",
-    "serve": "node bin/yoto-serve.js"
+    "serve": "node bin/yoto-serve.js",
+    "patch-covers": "node bin/yoto-patch-covers.js"
   },
   "dependencies": {
     "archiver": "^7.0.1",
