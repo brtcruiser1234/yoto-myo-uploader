@@ -1,80 +1,116 @@
 # yoto-myo-uploader
 
-Two tools for loading audiobooks onto [Yoto](https://yotoplay.com) MYO cards:
+Three tools for getting audiobooks onto [Yoto](https://yotoplay.com) MYO cards:
 
-- **`yoto-serve`** — browse and download your library from a local web UI
-- **`yoto-upload`** — upload a folder of audiobooks to your Yoto account as MYO cards
+| Tool | What it does |
+|------|-------------|
+| `yoto-convert` | Converts raw audiobook files (mp3/m4a/m4b) into organized, Yoto-ready MP3s with cover art |
+| `yoto-serve` | Browse and download your converted library from a local web UI |
+| `yoto-upload` | Upload converted books to your Yoto account as MYO cards |
 
 ## Requirements
 
 - [Node.js](https://nodejs.org) 18 or newer
-- A Yoto account
-- Audiobooks as MP3 files
+- [ffmpeg](https://ffmpeg.org) (for `yoto-convert` only)
+- A Yoto account (for `yoto-upload`)
+- Audiobooks as MP3, M4A, M4B, or other common formats
 
 ## Setup
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/yoto-myo-uploader.git
+git clone https://github.com/brtcruiser1234/yoto-myo-uploader.git
 cd yoto-myo-uploader
 npm install
 ```
 
-## Folder structure
+---
 
-One subfolder per book, MP3 files inside:
+## Step 1 — Convert: `yoto-convert`
+
+Converts a folder of audiobooks into organized MP3s with cover art. Skips books already converted.
+
+```bash
+node bin/yoto-convert.js /path/to/source /path/to/output
+```
+
+**Source structure** — one subfolder per book, any mix of audio formats:
 
 ```
-/my-audiobooks/
+/source/
+  The Hobbit/
+    01 - An Unexpected Party.m4a
+    02 - Roast Mutton.m4a
+    cover.jpg
+  Charlotte's Web/
+    01 Charlotte's Web.mp3
+    folder.jpeg
+```
+
+**Output structure** — organized, renamed, all MP3:
+
+```
+/output/
   The Hobbit/
     01 - An Unexpected Party.mp3
     02 - Roast Mutton.mp3
+    cover.jpg
   Charlotte's Web/
-    01 - Chapter One.mp3
-    02 - Chapter Two.mp3
+    01 - Charlotte's Web.mp3
+    cover.jpeg
 ```
 
-Each subfolder becomes one Yoto MYO card. The folder name becomes the card title.
+Install ffmpeg if you don't have it:
+```bash
+# Mac
+brew install ffmpeg
+
+# Ubuntu/Debian
+sudo apt install ffmpeg
+
+# Windows
+# Download from https://ffmpeg.org/download.html
+```
 
 ---
 
-## yoto-serve — browse & download
+## Step 2 — Browse: `yoto-serve`
 
 Start a local web server to browse your library and download books as ZIPs:
 
 ```bash
-node bin/yoto-serve.js /path/to/audiobooks
+node bin/yoto-serve.js /path/to/output
 ```
 
 Options:
 
 ```bash
-node bin/yoto-serve.js /path/to/audiobooks --port 3000 --password secret
+node bin/yoto-serve.js /path/to/output --port 3000 --password secret
 ```
 
-Open `http://localhost:3000` in your browser. You'll see a grid of all your books with cover art and a download button for each.
+Open `http://localhost:3000` — you'll see a grid of all your books with cover art and a download button for each.
 
 ---
 
-## yoto-upload — upload to Yoto
+## Step 3 — Upload: `yoto-upload`
 
 Upload all books to your Yoto account as MYO cards:
 
 ```bash
-node bin/yoto-upload.js /path/to/audiobooks
+node bin/yoto-upload.js /path/to/output
 ```
 
-The first time you run it, you'll see a link — open it and log in to your Yoto account. After that, your credentials are saved at `~/.yoto-myo-uploader/tokens.json`.
+The first time you run it, you'll see a link — open it and log in to your Yoto account. Credentials are saved to `~/.yoto-myo-uploader/tokens.json` so you only log in once.
 
 **Re-running is safe.** Already-uploaded books are skipped. Progress is saved to `~/.yoto-myo-uploader/progress.json`.
 
-### How it works
+### How the upload works
 
 For each track, the script:
-1. Gets a presigned S3 upload URL from Yoto
-2. Uploads the MP3 with `Content-Type: audio/mpeg` to trigger Yoto's transcoding pipeline
-3. Polls until transcoding finishes (~10–30 seconds per track)
-4. Creates the MYO card with all tracks
+1. Gets a presigned S3 URL from Yoto's API
+2. Uploads the MP3 with `Content-Type: audio/mpeg` (required to trigger transcoding)
+3. Polls Yoto's API until transcoding finishes (~10–30 seconds per track)
+4. Creates the MYO card using the transcoded file hash
 
 ### Timing
 
-Each track takes ~10–30 seconds to transcode on Yoto's servers. A 10-track book takes roughly 2–5 minutes. With 55 books it'll run for a couple hours — leave it going in the background.
+Each track takes ~10–30 seconds on Yoto's servers. A 10-track book takes roughly 2–5 minutes. Leave it running in the background for large libraries.

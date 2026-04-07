@@ -4,10 +4,12 @@
   "description": "Upload local audiobook folders to Yoto MYO cards, with a built-in web browser for your library",
   "type": "module",
   "bin": {
+    "yoto-convert": "./bin/yoto-convert.js",
     "yoto-upload": "./bin/yoto-upload.js",
     "yoto-serve": "./bin/yoto-serve.js"
   },
   "scripts": {
+    "convert": "node bin/yoto-convert.js",
     "upload": "node bin/yoto-upload.js",
     "serve": "node bin/yoto-serve.js"
   },
