@@ -14,7 +14,8 @@
     "convert": "node bin/yoto-convert.js",
     "upload": "node bin/yoto-upload.js",
     "serve": "node bin/yoto-serve.js",
-    "patch-covers": "node bin/yoto-patch-covers.js"
+    "patch-covers": "node bin/yoto-patch-covers.js",
+    "test": "node --test"
   },
   "dependencies": {
     "archiver": "^7.0.1",

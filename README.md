@@ -27,11 +27,17 @@ npm install
 
 ## Step 1 — Convert: `yoto-convert`
 
-Converts a folder of audiobooks into organized MP3s with cover art. Skips books already converted.
+Converts a folder of audiobooks into organized MP3s with cover art. Skips cards already converted.
 
 ```bash
-node bin/yoto-convert.js /path/to/source /path/to/output
+node bin/yoto-convert.js /path/to/source /path/to/output --dry-run
 ```
+
+Options: `--dry-run`, `--bitrate <kbps>` (default 64), `--stereo`, `--max-minutes <n>` (default 55), `--keep-author`, `--force-reencode`, `--chapters auto|off`.
+
+- **Chapters:** an M4B/M4A with chapter markers becomes one track per chapter, titled from the chapter name. A chapter longer than `--max-minutes` is split into equal parts. Use `--chapters off` to treat the file as one track.
+- **Large books:** a book over 500 MB or 100 tracks is spread across cards at track breaks, named `<Book> (Part 1 of 2)` and so on. The dry run shows where each card starts and ends.
+- **Cover:** when a book folder has no image, the cover embedded in its audio file is used.
 
 **Source structure** — one subfolder per book, any mix of audio formats:
 
