@@ -161,7 +161,7 @@ async function mapPool (items, limit, fn) {
   return results
 }
 
-async function uploadAndTranscode (client, filePath, accessToken) {
+async function uploadAndTranscode (client, filePath) {
   const data = await readFile(filePath)
   const sha256 = createHash('sha256').update(data).digest('hex')
   const filename = basename(filePath)
@@ -182,12 +182,22 @@ async function uploadAndTranscode (client, filePath, accessToken) {
 
   // Poll until transcoding is complete. Yoto usually finishes in ~10–30s, so we
   // poll every 3s (no long dead-wait before the first check). ~200 tries ≈ 10 min.
+  let lastStatus = null
   for (let i = 0; i < 200; i++) {
     await new Promise(r => setTimeout(r, 3000))
+    // Ask the client for the token on every poll: it refreshes an expired
+    // token, while a copy read from tokens.json at startup can be stale.
+    const accessToken = await client.token.getAccessToken()
     const pollResp = await fetch(`${YOTO_API}/media/upload/${upload.uploadId}/transcoded`, {
       headers: { Authorization: `Bearer ${accessToken}` }
     })
+    if (pollResp.status === 401 || pollResp.status === 403) {
+      const text = await pollResp.text().catch(() => '')
+      throw new Error(`Transcode status check for ${filename} was refused (${pollResp.status}): ${text.substring(0, 200)}`)
+    }
+    if (!pollResp.ok) { lastStatus = `HTTP ${pollResp.status}`; continue }
     const body = await pollResp.json()
+    lastStatus = body.transcode?.progress?.phase || 'no transcode status'
     const transcodedSha256 = body.transcode?.transcodedSha256
     if (transcodedSha256) {
       // The Yoto player needs `format` on each track to pick a decoder. Yoto
@@ -206,7 +216,7 @@ async function uploadAndTranscode (client, filePath, accessToken) {
       throw new Error(`Yoto transcoding failed for ${filename}`)
     }
   }
-  throw new Error(`Transcoding timed out for ${filename} after 10 minutes`)
+  throw new Error(`Transcoding timed out for ${filename} after 10 minutes (last status: ${lastStatus})`)
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
@@ -234,7 +244,6 @@ async function main () {
   console.log(`Books folder: ${booksDir}\n`)
 
   const client = await authenticate()
-  const tokens = await loadTokens()
   const progress = await loadProgress(booksDir)
 
   const entries = (await readdir(booksDir, { withFileTypes: true }))
@@ -277,7 +286,7 @@ async function main () {
     // Upload + transcode tracks concurrently; mapPool returns results in file order.
     const results = await mapPool(files, CONCURRENCY, async (file, t) => {
       const trackTitle = file.replace(/^\d+[\s._-]+/, '').replace(/\.mp3$/i, '')
-      const media = await uploadAndTranscode(client, join(bookDir, file), tokens.accessToken)
+      const media = await uploadAndTranscode(client, join(bookDir, file))
       console.log(`    [${t + 1}/${files.length}] ${trackTitle} ✓`)
       return { trackTitle, ...media }
     })
