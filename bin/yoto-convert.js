@@ -11,8 +11,14 @@
  * Yoto MYO limits enforced here:
  *   - 100 tracks per card
  *   - 60 min / 100 MB per single track   -> long tracks are split
- *   - 500 MB per card                    -> handled by re-encoding to 64k mono
+ *   - 500 MB per card                    -> re-encode to 64k mono; a book that is
+ *                                           still too big is spread across cards
+ *                                           ("<Book> (Part 1 of 2)") at track breaks
  *   (5 h/card is a soft limit Yoto does not hard-enforce; size is the real cap.)
+ *
+ * M4B/M4A files with chapter markers become one track per chapter, titled from
+ * the chapter name. A book folder without an image uses the cover embedded in
+ * its audio file.
  *
  * Usage:
  *   node bin/yoto-convert.js <source> <output> [options]
@@ -25,6 +31,8 @@
  *   --keep-author        Keep the top-level folder (author) in the card name.
  *                        Default drops it when the tree is nested.
  *   --force-reencode     Re-encode even already-conformant MP3s.
+ *   --chapters <mode>    auto (default): split M4B/M4A at chapter markers.
+ *                        off: treat each file as one track.
  *
  * Source tree (any depth; a "book" is any folder that directly contains audio):
  *   /source/
@@ -38,9 +46,11 @@
  */
 
 import { readdir, mkdir, copyFile, stat, access, rename, rm, readFile } from 'fs/promises'
+import { realpathSync } from 'fs'
 import { join, extname, basename, resolve, relative, sep } from 'path'
 import { execFile } from 'child_process'
 import { promisify } from 'util'
+import { fileURLToPath } from 'url'
 
 const execFileAsync = promisify(execFile)
 
@@ -69,6 +79,10 @@ async function chooseCover (bookDir, files) {
 const MAX_TRACKS_PER_CARD = 100
 const MAX_TRACK_MB = 100
 const MAX_CARD_MB = 500
+// Projected MB are estimates (MP3 framing and tags add a little), so spread
+// books across cards against a slightly lower ceiling.
+const CARD_FILL_MB = MAX_CARD_MB * 0.97
+const CHAPTER_EXTS = new Set(['.m4b', '.m4a'])
 
 // ── Options ────────────────────────────────────────────────────────────────
 function parseArgs (argv) {
@@ -79,7 +93,8 @@ function parseArgs (argv) {
     channels: 1,        // mono
     maxMinutes: 55,
     keepAuthor: false,
-    forceReencode: false
+    forceReencode: false,
+    chapters: 'auto'
   }
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]
@@ -89,7 +104,10 @@ function parseArgs (argv) {
     else if (a === '--force-reencode') opts.forceReencode = true
     else if (a === '--bitrate') opts.bitrate = parseInt(argv[++i], 10)
     else if (a === '--max-minutes') opts.maxMinutes = parseInt(argv[++i], 10)
-    else if (a.startsWith('--')) { console.error(`Unknown option: ${a}`); process.exit(1) }
+    else if (a === '--chapters') {
+      opts.chapters = argv[++i]
+      if (!['auto', 'off'].includes(opts.chapters)) { console.error('--chapters must be auto or off'); process.exit(1) }
+    } else if (a.startsWith('--')) { console.error(`Unknown option: ${a}`); process.exit(1) }
     else positional.push(a)
   }
   return { positional, opts }
@@ -113,10 +131,91 @@ async function probe (file) {
     const audio = (j.streams || []).find(s => s.codec_type === 'audio') || {}
     const br = audio.bit_rate ? Math.round(parseInt(audio.bit_rate, 10) / 1000) : null
     const ch = audio.channels || null
-    return { duration: dur, bitrate: br, channels: ch }
+    const hasPicture = (j.streams || []).some(s => s.codec_type === 'video')
+    return { duration: dur, bitrate: br, channels: ch, hasPicture }
   } catch {
-    return { duration: 0, bitrate: null, channels: null }
+    return { duration: 0, bitrate: null, channels: null, hasPicture: false }
   }
+}
+
+// Returns [{ start, end, title }] in seconds; [] when the file has no chapters.
+async function probeChapters (file) {
+  try {
+    const { stdout } = await execFileAsync('ffprobe', [
+      '-v', 'error', '-show_chapters', '-of', 'json', file
+    ], { maxBuffer: 16 * 1024 * 1024 })
+    return parseChapters(JSON.parse(stdout))
+  } catch {
+    return []
+  }
+}
+
+export function parseChapters (ffprobeJson) {
+  return (ffprobeJson.chapters || [])
+    .map(c => ({
+      start: parseFloat(c.start_time),
+      end: parseFloat(c.end_time),
+      title: (c.tags?.title || '').trim()
+    }))
+    .filter(c => Number.isFinite(c.start) && Number.isFinite(c.end) && c.end > c.start)
+    .sort((a, b) => a.start - b.start)
+}
+
+// Track titles come from file names (yoto-upload strips the "NNN - " prefix),
+// so map characters that are unsafe in file names to readable equivalents.
+export function safeFileTitle (title) {
+  return title
+    .replace(/\s*:\s*/g, ' - ')
+    .replace(/[/\\]/g, '-')
+    .replace(/[*?"<>|]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+// Equal-length [start, end] ranges that cover [start, end] in `parts` pieces.
+export function splitRange (start, end, parts) {
+  const step = (end - start) / parts
+  return Array.from({ length: parts }, (_, k) => [
+    start + k * step,
+    k === parts - 1 ? end : start + (k + 1) * step
+  ])
+}
+
+// Spread items (each { projMB, parts }) across the fewest cards that fit
+// Yoto's limits, cutting only between items and balancing MB across cards.
+// Returns an array of item arrays, in order.
+export function partitionCards (items, fillMB = CARD_FILL_MB, maxTracks = MAX_TRACKS_PER_CARD) {
+  const totalMB = items.reduce((n, it) => n + it.projMB, 0)
+  const totalTracks = items.reduce((n, it) => n + it.parts, 0)
+  let n = Math.max(1, Math.ceil(totalMB / fillMB), Math.ceil(totalTracks / maxTracks))
+  for (; n <= items.length; n++) {
+    if (n === 1) {
+      if (totalMB <= fillMB && totalTracks <= maxTracks) return [items]
+      continue
+    }
+    const cum = []
+    items.reduce((acc, it, i) => { cum[i] = acc + it.projMB; return cum[i] }, 0)
+    const cuts = []
+    let from = 0
+    for (let k = 1; k < n; k++) {
+      const target = (totalMB * k) / n
+      let best = from
+      for (let i = from; i < items.length - (n - k); i++) {
+        if (Math.abs(cum[i] - target) < Math.abs(cum[best] - target)) best = i
+      }
+      cuts.push(best + 1)
+      from = best + 1
+    }
+    const cards = []
+    let s = 0
+    for (const c of [...cuts, items.length]) { cards.push(items.slice(s, c)); s = c }
+    const fits = cards.every(card =>
+      card.length > 0 &&
+      card.reduce((m, it) => m + it.projMB, 0) <= fillMB &&
+      card.reduce((t, it) => t + it.parts, 0) <= maxTracks)
+    if (fits) return cards
+  }
+  return items.map(it => [it])
 }
 
 async function exists (p) { try { await access(p); return true } catch { return false } }
@@ -150,16 +249,56 @@ function cleanTrackTitle (filename, ext) {
 const FF_QUIET = ['-hide_banner', '-nostats', '-loglevel', 'error']
 const FF_EXEC_OPTS = { maxBuffer: 16 * 1024 * 1024 }
 
-// ffmpeg encode args for a single mono/stereo re-encode
-function encodeArgs (input, output, opts) {
+// ffmpeg encode args for a single mono/stereo re-encode. With `range`
+// ([start, end] seconds) only that part of the input is encoded. Seeking
+// before -i is fast and, because the audio is decoded, sample-accurate.
+export function encodeArgs (input, output, opts, range = null) {
+  const seek = range ? ['-ss', range[0].toFixed(3), '-to', range[1].toFixed(3)] : []
   return [
     ...FF_QUIET,
+    ...seek,
     '-i', input, '-vn', '-map', '0:a:0',
     '-ac', String(opts.channels),
     '-ar', '44100',
     '-b:a', `${opts.bitrate}k`,
+    '-f', 'mp3',
     '-y', output
   ]
+}
+
+// Encode to a temp name, then rename, so an interrupted run never leaves a
+// truncated MP3 that a re-run would mistake for a finished track.
+async function encodeTo (input, out, opts, range = null) {
+  const tmp = `${out}.partial`
+  try {
+    await execFileAsync('ffmpeg', encodeArgs(input, tmp, opts, range), FF_EXEC_OPTS)
+    await rename(tmp, out)
+  } catch (err) {
+    await rm(tmp, { force: true })
+    throw err
+  }
+}
+
+// Expand an audio file into one item per chapter. Returns null when the file
+// has fewer than two chapters, so the caller treats it as a single track.
+export function chapterItems (base, chapters, opts) {
+  if (chapters.length < 2) return null
+  const maxSec = opts.maxMinutes * 60
+  return chapters.map(c => {
+    const duration = c.end - c.start
+    const projMB = (opts.bitrate / 8) * duration / 1000
+    const parts = Math.max(1, Math.ceil(duration / maxSec), Math.ceil(projMB / MAX_TRACK_MB))
+    return {
+      ...base,
+      rawTitle: safeFileTitle(c.title),
+      start: c.start,
+      end: c.end,
+      duration,
+      action: parts > 1 ? 'split' : 'encode',
+      parts,
+      projMB
+    }
+  })
 }
 
 // ── Discover books: any folder that directly contains audio files ─────────────
@@ -209,13 +348,20 @@ async function planBook (bookDir, opts) {
     .sort()
 
   const items = []
+  let embeddedCover = null
   for (const f of files) {
     const p = join(bookDir, f)
     const ext = extname(f).toLowerCase()
-    const { duration, bitrate, channels } = await probe(p)
+    const { duration, bitrate, channels, hasPicture } = await probe(p)
+    if (hasPicture && !embeddedCover) embeddedCover = p
     const sizeBytes = (await stat(p)).size
     const sizeMB = sizeBytes / 1e6
     const rawTitle = cleanTrackTitle(f, ext)
+
+    if (opts.chapters === 'auto' && CHAPTER_EXTS.has(ext)) {
+      const chItems = chapterItems({ file: f, path: p, ext, bitrate, channels, sizeMB }, await probeChapters(p), opts)
+      if (chItems) { items.push(...chItems); continue }
+    }
 
     const fitsDur = duration > 0 && duration <= maxSec
     const alreadyGood = !opts.forceReencode &&
@@ -250,33 +396,49 @@ async function planBook (bookDir, opts) {
   const totalMB = items.reduce((n, it) => n + it.projMB, 0)
   const totalDur = items.reduce((n, it) => n + it.duration, 0)
   const cover = await chooseCover(bookDir, await readdir(bookDir))
-  return { items, totalTracks, totalMB, totalDur, cover }
+  const cards = partitionCards(items)
+  return { items, totalTracks, totalMB, totalDur, cover, embeddedCover: cover ? null : embeddedCover, cards }
 }
 
-// ── Execute the plan for one book ─────────────────────────────────────────────
-async function convertBook (bookDir, bookOut, plan, opts) {
-  await mkdir(bookOut, { recursive: true })
+// ── Execute the plan for one card ─────────────────────────────────────────────
+async function convertCard (bookDir, cardOut, items, plan, opts) {
+  await mkdir(cardOut, { recursive: true })
   let track = 0
   const pad = n => String(n).padStart(3, '0')
+  const enc = `${opts.bitrate}k ${opts.channels === 1 ? 'mono' : 'stereo'}`
+  const hasRange = it => it.start != null
 
-  for (const it of plan.items) {
+  for (const it of items) {
     if (it.action === 'copy') {
       track++
-      const out = join(bookOut, `${pad(track)} - ${it.title}.mp3`)
+      const out = join(cardOut, `${pad(track)} - ${it.title}.mp3`)
       process.stdout.write(`  [${pad(track)}] ${it.title} (copy)`)
       if (await exists(out)) { console.log(' (exists)'); continue }
       await copyFile(it.path, out)
       console.log(' ✓')
     } else if (it.action === 'encode') {
       track++
-      const out = join(bookOut, `${pad(track)} - ${it.title}.mp3`)
-      process.stdout.write(`  [${pad(track)}] ${it.title} (${opts.bitrate}k ${opts.channels === 1 ? 'mono' : 'stereo'})`)
+      const out = join(cardOut, `${pad(track)} - ${it.title}.mp3`)
+      process.stdout.write(`  [${pad(track)}] ${it.title} (${enc})`)
       if (await exists(out)) { console.log(' (exists)'); continue }
       try {
-        await execFileAsync('ffmpeg', encodeArgs(it.path, out, opts), FF_EXEC_OPTS)
+        await encodeTo(it.path, out, opts, hasRange(it) ? [it.start, it.end] : null)
         console.log(' ✓')
       } catch (err) { console.log(` FAILED: ${ffErr(err)}`) }
-    } else { // split
+    } else if (hasRange(it)) { // split one chapter into balanced ranges
+      const ranges = splitRange(it.start, it.end, it.parts)
+      for (let k = 0; k < ranges.length; k++) {
+        track++
+        const label = `${it.title} (Part ${k + 1})`
+        const out = join(cardOut, `${pad(track)} - ${label}.mp3`)
+        process.stdout.write(`  [${pad(track)}] ${label} (${enc})`)
+        if (await exists(out)) { console.log(' (exists)'); continue }
+        try {
+          await encodeTo(it.path, out, opts, ranges[k])
+          console.log(' ✓')
+        } catch (err) { console.log(` FAILED: ${ffErr(err)}`) }
+      }
+    } else { // split a whole file
       const numParts = Math.max(2, Math.ceil(it.duration / (opts.maxMinutes * 60)))
       const step = it.duration / numParts // balanced parts
       // Explicit cut points -> exactly numParts files, last runs to EOF (no sliver).
@@ -284,7 +446,7 @@ async function convertBook (bookDir, bookOut, plan, opts) {
       process.stdout.write(`  ${it.title}: splitting into ${numParts} parts (~${Math.round(step / 60)} min each)\n`)
       // Write segments into a plain temp subdir (NOT dotfiles — some SMB/NAS
       // mounts reject hidden-file creation by the segment muxer), then move.
-      const tmpDir = join(bookOut, '_segtmp')
+      const tmpDir = join(cardOut, '_segtmp')
       await rm(tmpDir, { recursive: true, force: true })
       await mkdir(tmpDir, { recursive: true })
       try {
@@ -299,7 +461,7 @@ async function convertBook (bookDir, bookOut, plan, opts) {
       const segs = (await readdir(tmpDir)).filter(f => f.endsWith('.mp3')).sort()
       for (let k = 0; k < segs.length; k++) {
         track++
-        const out = join(bookOut, `${pad(track)} - ${it.title} (Part ${k + 1}).mp3`)
+        const out = join(cardOut, `${pad(track)} - ${it.title} (Part ${k + 1}).mp3`)
         await rename(join(tmpDir, segs[k]), out)
         console.log(`    [${pad(track)}] ${it.title} (Part ${k + 1}) ✓`)
       }
@@ -311,8 +473,15 @@ async function convertBook (bookDir, bookOut, plan, opts) {
   const cover = plan.cover
   if (cover) {
     const destName = `cover${extname(cover).toLowerCase()}`
-    await copyFile(join(bookDir, cover), join(bookOut, destName))
+    await copyFile(join(bookDir, cover), join(cardOut, destName))
     console.log(`  Cover copied (${cover}${COVER_NAMES.includes(cover.toLowerCase()) ? '' : ' → cover' + extname(cover).toLowerCase()})`)
+  } else if (plan.embeddedCover) {
+    try {
+      await execFileAsync('ffmpeg', [
+        ...FF_QUIET, '-i', plan.embeddedCover, '-map', '0:v:0', '-frames:v', '1', '-c:v', 'mjpeg', '-q:v', '2', '-f', 'image2', '-y', join(cardOut, 'cover.jpg')
+      ], FF_EXEC_OPTS)
+      console.log(`  Cover extracted from ${basename(plan.embeddedCover)}`)
+    } catch (err) { console.log(`  Cover extraction FAILED: ${ffErr(err)}`) }
   } else {
     console.log('  (no cover art found)')
   }
@@ -334,7 +503,7 @@ async function main () {
   if (!positional[0] || !positional[1]) {
     console.error('Usage: node bin/yoto-convert.js <source> <output> [options]')
     console.error('  --dry-run  --bitrate <kbps>  --stereo  --max-minutes <n>')
-    console.error('  --keep-author  --force-reencode')
+    console.error('  --keep-author  --force-reencode  --chapters auto|off')
     console.error('\nTip: run with --dry-run first to see the plan before writing anything.')
     process.exit(1)
   }
@@ -366,40 +535,54 @@ async function main () {
   for (let i = 0; i < books.length; i++) {
     const bookDir = books[i]
     const name = cardName(sourceDir, bookDir, opts.keepAuthor)
-    const bookOut = join(outputDir, name)
     console.log(`[${i + 1}/${books.length}] ${name}`)
 
-    // resumable skip
-    if (!opts.dryRun && await exists(bookOut)) {
-      const have = (await readdir(bookOut)).filter(f => extname(f).toLowerCase() === '.mp3')
-      if (have.length > 0) { console.log('  Skip (already converted).\n'); skipped++; continue }
-    }
-
     const plan = await planBook(bookDir, opts)
-    const flags = limitFlags(plan.totalTracks, plan.totalMB, plan.totalDur)
-
     // Plan summary line
+    const nChapters = plan.items.filter(it => it.start != null).length
     const nCopy = plan.items.filter(it => it.action === 'copy').length
     const nEnc = plan.items.filter(it => it.action === 'encode').length
     const nSplit = plan.items.filter(it => it.action === 'split').length
-    console.log(`  Plan: ${plan.items.length} source file(s) -> ${plan.totalTracks} track(s) ` +
+    console.log(`  Plan: ${plan.items.length} item(s)${nChapters ? ` (${nChapters} from chapter markers)` : ''} -> ${plan.totalTracks} track(s) ` +
       `(${nCopy} copy, ${nEnc} re-encode, ${nSplit} split), ` +
       `~${plan.totalMB.toFixed(0)} MB, ${(plan.totalDur / 3600).toFixed(1)} h`)
-    console.log(`  Cover: ${plan.cover || '⚠ none found'}`)
-    if (flags.length) { console.log(`  ${flags.join('  ')}`); warnings.push(`${name}: ${flags.join(', ')}`) }
+    console.log(`  Cover: ${plan.cover || (plan.embeddedCover ? `embedded in ${basename(plan.embeddedCover)}` : '⚠ none found')}`)
+
+    const cardNames = plan.cards.length === 1
+      ? [name]
+      : plan.cards.map((_, c) => `${name} (Part ${c + 1} of ${plan.cards.length})`)
+    plan.cards.forEach((card, c) => {
+      const tracks = card.reduce((n, it) => n + it.parts, 0)
+      const mb = card.reduce((n, it) => n + it.projMB, 0)
+      const h = card.reduce((n, it) => n + it.duration, 0) / 3600
+      const cardFlags = limitFlags(tracks, mb, h)
+      console.log(`  Card "${cardNames[c]}": ${tracks} track(s), ~${mb.toFixed(0)} MB, ${h.toFixed(1)} h` +
+        `${card.length ? `, "${card[0].title}" .. "${card[card.length - 1].title}"` : ''}` +
+        `${cardFlags.length ? '  ' + cardFlags.join('  ') : ''}`)
+      if (cardFlags.length) warnings.push(`${cardNames[c]}: ${cardFlags.join(', ')}`)
+    })
 
     if (opts.dryRun) { console.log(''); continue }
 
-    await convertBook(bookDir, bookOut, plan, opts)
+    for (let c = 0; c < plan.cards.length; c++) {
+      const cardOut = join(outputDir, cardNames[c])
+      const want = plan.cards[c].reduce((n, it) => n + it.parts, 0)
+      if (await exists(cardOut)) {
+        const have = (await readdir(cardOut)).filter(f => extname(f).toLowerCase() === '.mp3')
+        if (have.length >= want) { console.log(`  Skip "${cardNames[c]}" (already converted).`); skipped++; continue }
+      }
+      if (plan.cards.length > 1) console.log(`  -> ${cardNames[c]}`)
+      await convertCard(bookDir, cardOut, plan.cards[c], plan, opts)
+      converted++
+    }
     console.log('')
-    converted++
   }
 
   console.log('─'.repeat(60))
   if (opts.dryRun) {
     console.log(`Dry run complete. ${books.length} book(s) planned.`)
   } else {
-    console.log(`Done! ${converted} converted, ${skipped} skipped.`)
+    console.log(`Done! ${converted} card(s) converted, ${skipped} skipped.`)
     console.log(`Output: ${outputDir}`)
     console.log(`\nNext: node bin/yoto-upload.js "${outputDir}"`)
   }
@@ -409,4 +592,7 @@ async function main () {
   }
 }
 
-main().catch(err => { console.error('\nError:', err.message); process.exit(1) })
+const invokedDirectly = (() => {
+  try { return realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url)) } catch { return false }
+})()
+if (invokedDirectly) main().catch(err => { console.error('\nError:', err.message); process.exit(1) })
